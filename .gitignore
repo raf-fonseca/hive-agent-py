@@ -4,6 +4,7 @@ storage
 
 .env
 venv
+.venv
 
 **/*.egg-info
 build
@@ -12,3 +13,7 @@ build
 .vscode
 
 .DS_Store
+
+*.db
+**/*/hive-agent-data/
+hive-agent-data/

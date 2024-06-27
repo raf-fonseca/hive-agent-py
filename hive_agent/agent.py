@@ -1,96 +1,136 @@
 import asyncio
 import logging
-import os
 import signal
 import sys
 import uvicorn
 
-from typing import Callable, List
+from typing import Callable, List, Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from llama_index.agent.openai import OpenAIAgent
+from llama_index.core.agent import FunctionCallingAgentWorker
+
+from hive_agent.llms import OpenAILLM
+from hive_agent.llms import ClaudeLLM
+from hive_agent.llms import MistralLLM
+from hive_agent.llms import OllamaLLM
+
 from llama_index.core.llms import ChatMessage
 from llama_index.core.tools import FunctionTool
 
 from hive_agent.llm_settings import init_llm_settings
 from hive_agent.server.routes import setup_routes
-from hive_agent.wallet import WalletStore
+from hive_agent.tools.agent_db import get_db_schemas, text_2_sql
 
 from dotenv import load_dotenv
+from hive_agent.config import Config
 
 load_dotenv()
-
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
 
 
 class HiveAgent:
     name: str
-    wallet_store: WalletStore
-    __agent: OpenAIAgent
+    wallet_store: "WalletStore"  # this attribute will be conditionally initialized
+    __agent: Any
 
     def __init__(
-            self,
-            name: str,
-            functions: List[Callable],
-            host="0.0.0.0",
-            port=8000,
-            instruction="",
-            db_url="sqlite+aiosqlite:///hive_agent.db"
+        self,
+        name: str,
+        functions: List[Callable],
+        config_path="../../hive_config_example.toml",
+        host="0.0.0.0",
+        port=8000,
+        instruction="",
+        role=""
     ):
         self.name = name
         self.functions = functions
+        self.config_path = config_path
         self.host = host
         self.port = port
         self.app = FastAPI()
         self.shutdown_event = asyncio.Event()
         self.instruction = instruction
+        self.__role__ = role
+        self.optional_dependencies = {}
 
-        self.__setup(db_url)
+        self.config = Config(config_path=config_path)
 
-    def __setup(self, db_url: str):
-        agent_tools = [FunctionTool.from_defaults(fn=func) for func in self.functions]
-        self.__agent = OpenAIAgent.from_tools(
-            agent_tools,
-            system_prompt=f"""You are a domain-specific assistant that is helpful, respectful and honest. Always 
-            answer as helpfully as possible, while being safe. Your answers should not include any harmful, 
-            unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are 
-            socially unbiased and positive in nature. If a question does not make any sense, or is not factually 
-            coherent, explain why instead of answering something not correct. If you don't know the answer to a 
-            question, please don't share false information.
+        logging.basicConfig(stream=sys.stdout, level=self.config.get_log_level())
+        logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
 
-            You may be provided with tools to help you answer questions. Always ensure you use the result from 
-            the most appropriate/relevant function tool to answer the original question in the user's prompt and comment
-            on any provided data from the user or from the function result. Whenever you use a tool, explain your answer
-            based on the tool result.
+        self.logger = logging.getLogger()
+        self.logger.setLevel(self.config.get_log_level())
 
-            Here is your domain-specific instruction:
-            {self.instruction}
-            """
-        )
+        self._check_optional_dependencies()
+        self.__setup()
 
-        self.wallet_store = WalletStore()
-        self.wallet_store.add_wallet()
+    def _check_optional_dependencies(self):
+        try:
+            from web3 import Web3
 
-        self.__setup_server(db_url)
+            self.optional_dependencies["web3"] = True
+        except ImportError:
+            self.optional_dependencies["web3"] = False
 
-    def __setup_server(self, db_url: str):
-        init_llm_settings()
+    def __setup(self):
+        init_llm_settings(self.config)
+        custom_tools = self._tools_from_funcs(self.functions)
+
+        # TODO: pass db client to db tools directly
+        system_tools = self._tools_from_funcs([get_db_schemas, text_2_sql])
+
+        tools = custom_tools + system_tools
+
+        model = self.config.get("model", "model", "gpt-3.5-turbo")
+        if "gpt" in model:
+            self.__agent = OpenAILLM(tools, self.instruction).agent
+        elif "claude" in model:
+            self.__agent = ClaudeLLM(tools, self.instruction).agent
+        elif "llama" in model:
+            self.__agent = OllamaLLM(tools, self.instruction).agent
+        elif "mixtral" or "mistral" in model:
+            self.__agent = MistralLLM(tools, self.instruction).agent
+        else:
+            self.__agent = OpenAILLM(tools, self.instruction).agent
+
+        if self.optional_dependencies.get("web3"):
+            from hive_agent.wallet import WalletStore
+
+            self.wallet_store = WalletStore()
+            self.wallet_store.add_wallet()
+        else:
+            self.wallet_store = None
+            self.logger.warning(
+                "'web3' extras not installed. Web3-related functionality will not be available."
+            )
+
+        self.__setup_server()
+
+    @staticmethod
+    def _tools_from_funcs(funcs: List[Callable]) -> List[FunctionTool]:
+        return [FunctionTool.from_defaults(fn=func) for func in funcs]
+
+    def __setup_server(self):
 
         self.configure_cors()
-        setup_routes(self.app, self.__agent, db_url)
+        setup_routes(self.app, self.__agent)
 
         signal.signal(signal.SIGINT, self.__signal_handler)
         signal.signal(signal.SIGTERM, self.__signal_handler)
 
     def configure_cors(self):
-        environment = os.getenv("ENVIRONMENT", "dev")  # default to 'development' if not set
+        environment = self.config.get(
+            "environment", "type"
+        )  # default to 'development' if not set
 
         if environment == "dev":
             logger = logging.getLogger("uvicorn")
-            logger.warning("Running in development mode - allowing CORS for all origins")
+            logger.warning(
+                "Running in development mode - allowing CORS for all origins"
+            )
             self.app.add_middleware(
                 CORSMiddleware,
                 allow_origins=["*"],
@@ -101,11 +141,15 @@ class HiveAgent:
 
     async def run_server(self):
         try:
-            config = uvicorn.Config(app=self.app, host=self.host, port=self.port, loop="asyncio")
+            config = uvicorn.Config(
+                app=self.app, host=self.host, port=self.port, loop="asyncio"
+            )
             server = uvicorn.Server(config)
             await server.serve()
         except Exception as e:
-            logging.error(f"unexpected error while running the server: {e}", exc_info=True)
+            logging.error(
+                f"unexpected error while running the server: {e}", exc_info=True
+            )
         finally:
             await self.__cleanup()
 
@@ -114,7 +158,9 @@ class HiveAgent:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self.run_server())
         except Exception as e:
-            logging.error(f"An error occurred in the main event loop: {e}", exc_info=True)
+            logging.error(
+                f"An error occurred in the main event loop: {e}", exc_info=True
+            )
 
     def chat_history(self) -> List[ChatMessage]:
         return self.__agent.chat_history
@@ -138,7 +184,7 @@ class HiveAgent:
 
     async def __cleanup(self):
         try:
-            if hasattr(self, 'db_session'):
+            if hasattr(self, "db_session"):
                 await self.db_session.close()
                 logging.debug("database connection closed")
         except Exception as e:
