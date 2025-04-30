@@ -3,7 +3,10 @@ __pycache__
 storage
 
 .env
+tests/.env
 venv
+.venv
+.coverage
 
 **/*.egg-info
 build
@@ -12,3 +15,7 @@ build
 .vscode
 
 .DS_Store
+
+*.db
+**/*/hive-agent-data/
+hive-agent-data/
